@@ -1,13 +1,22 @@
+import AppKit
 import CoreAudio
 import Foundation
 import os
 
-// Bluetooth ヘッドセット（WH-1000XM6 等）を接続すると macOS が入力デバイスまで奪い、
-// A2DP から HFP に落ちて出力音質まで劣化する。入力が Bluetooth 側に移ったら内蔵マイクへ戻す。
-// USB マイクや連係マイクは対象外（Bluetooth のときだけ介入する）。
+// メニューバーから選んだマイクを既定入力に固定し続ける常駐アプリ。
+//
+// Bluetooth ヘッドセットを接続すると macOS は入力デバイスまで奪う。ヘッドセットのマイクが
+// 既定入力になるとプロファイルが A2DP から HFP（ハンズフリー）に落ち、再生音質まで劣化する。
+// 固定先を決めておけば、奪われても即座に戻る。
 
 private let logger = Logger(subsystem: "com.tomato.mic-lock", category: "lock")
 private let system = AudioObjectID(kAudioObjectSystemObject)
+private let lockedUIDKey = "lockedInputDeviceUID"
+
+// A2DP（音楽用）は 44.1kHz 以上。HFP（ハンズフリー）は 16kHz 以下に落ちる。
+private let a2dpMinimumSampleRate: Double = 44100
+
+// MARK: - CoreAudio
 
 private func address(_ selector: AudioObjectPropertySelector,
                      _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal)
@@ -17,12 +26,20 @@ private func address(_ selector: AudioObjectPropertySelector,
                                mElement: kAudioObjectPropertyElementMain)
 }
 
-private func defaultInputDevice() -> AudioDeviceID {
+private func deviceID(for selector: AudioObjectPropertySelector) -> AudioDeviceID {
     var id = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    var addr = address(kAudioHardwarePropertyDefaultInputDevice)
+    var addr = address(selector)
     AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &id)
     return id
+}
+
+private func defaultInputDevice() -> AudioDeviceID {
+    deviceID(for: kAudioHardwarePropertyDefaultInputDevice)
+}
+
+private func defaultOutputDevice() -> AudioDeviceID {
+    deviceID(for: kAudioHardwarePropertyDefaultOutputDevice)
 }
 
 @discardableResult
@@ -41,13 +58,30 @@ private func transportType(_ id: AudioDeviceID) -> UInt32 {
     return value
 }
 
-private func deviceName(_ id: AudioDeviceID) -> String {
+private func stringProperty(_ id: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> String? {
     var value: Unmanaged<CFString>?
     var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    var addr = address(kAudioObjectPropertyName)
+    var addr = address(selector)
     guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr,
-          let name = value?.takeRetainedValue() else { return "unknown" }
-    return name as String
+          let result = value?.takeRetainedValue() else { return nil }
+    return result as String
+}
+
+private func deviceName(_ id: AudioDeviceID) -> String {
+    stringProperty(id, kAudioObjectPropertyName) ?? "不明なデバイス"
+}
+
+// AudioDeviceID は再接続で変わるため、固定先の永続化には UID を使う。
+private func deviceUID(_ id: AudioDeviceID) -> String? {
+    stringProperty(id, kAudioDevicePropertyDeviceUID)
+}
+
+private func sampleRate(_ id: AudioDeviceID) -> Double {
+    var value: Float64 = 0
+    var size = UInt32(MemoryLayout<Float64>.size)
+    var addr = address(kAudioDevicePropertyNominalSampleRate)
+    AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value)
+    return value
 }
 
 private func hasInputChannels(_ id: AudioDeviceID) -> Bool {
@@ -62,51 +96,242 @@ private func hasInputChannels(_ id: AudioDeviceID) -> Bool {
     return list.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
 }
 
-private func builtInInputDevice() -> AudioDeviceID? {
+private func allDevices() -> [AudioDeviceID] {
     var addr = address(kAudioHardwarePropertyDevices)
     var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return nil }
+    guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return [] }
     var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
-    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return nil }
-    return ids.first { hasInputChannels($0) && transportType($0) == kAudioDeviceTransportTypeBuiltIn }
+    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids
 }
 
-private func enforceBuiltInInput() {
-    let current = defaultInputDevice()
-    guard transportType(current) == kAudioDeviceTransportTypeBluetooth else { return }
-    guard let builtIn = builtInInputDevice() else {
-        logger.notice("内蔵マイクが見つからないため切り替えを見送った")
-        return
+private func inputDevices() -> [AudioDeviceID] {
+    allDevices().filter(hasInputChannels)
+}
+
+private func device(forUID uid: String) -> AudioDeviceID? {
+    inputDevices().first { deviceUID($0) == uid }
+}
+
+private func builtInInputDevice() -> AudioDeviceID? {
+    inputDevices().first { transportType($0) == kAudioDeviceTransportTypeBuiltIn }
+}
+
+// MARK: - アプリ
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var statusItem: NSStatusItem!
+    private var pendingEnforce: DispatchWorkItem?
+
+    /// 固定先デバイスの UID。nil は「固定しない」。
+    private var lockedUID: String? {
+        get {
+            guard let stored = UserDefaults.standard.string(forKey: lockedUIDKey), !stored.isEmpty else { return nil }
+            return stored
+        }
+        set { UserDefaults.standard.set(newValue ?? "", forKey: lockedUIDKey) }
     }
-    let taken = deviceName(current)
-    let status = setDefaultInputDevice(builtIn)
-    if status == noErr {
-        logger.notice("入力を \(taken, privacy: .public) から \(deviceName(builtIn), privacy: .public) へ戻した")
-    } else {
-        logger.notice("入力の切り替えに失敗した status=\(status)")
+
+    private var hasStoredPreference: Bool {
+        UserDefaults.standard.object(forKey: lockedUIDKey) != nil
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 初回起動時は内蔵マイクを固定先にする（Bluetooth に奪われるのを防ぐのが主目的のため）。
+        if !hasStoredPreference, let builtIn = builtInInputDevice() {
+            lockedUID = deviceUID(builtIn)
+        }
+
+        // autosaveName が無いと macOS は配置位置を決められず、アイコンを画面外
+        // （x = -4506 等）に置いてしまい一切表示されない。初回だけ既定位置も与える。
+        let positionKey = "NSStatusItem Preferred Position mic-lock"
+        if UserDefaults.standard.object(forKey: positionKey) == nil {
+            UserDefaults.standard.set(500, forKey: positionKey)
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = "mic-lock"
+        statusItem.isVisible = true
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+
+        registerListeners()
+        enforce()
+        refreshStatusItem()
+
+        logger.notice("mic-lock 起動 固定先=\(self.lockedDeviceDescription(), privacy: .public)")
+    }
+
+    // MARK: 固定の実行
+
+    private func enforce() {
+        guard let uid = lockedUID else { return }
+        guard let target = device(forUID: uid) else { return } // 固定先が未接続なら何もしない
+        let current = defaultInputDevice()
+        guard current != target else { return }
+
+        let takenBy = deviceName(current)
+        let status = setDefaultInputDevice(target)
+        if status == noErr {
+            logger.notice("入力を \(takenBy, privacy: .public) から \(deviceName(target), privacy: .public) へ戻した")
+        } else {
+            logger.notice("入力の切り替えに失敗した status=\(status)")
+        }
+    }
+
+    /// Bluetooth 接続直後は「デバイス追加 → 遅れて入力が奪われる」順で起きるため少し待って再判定する。
+    private func scheduleEnforce() {
+        pendingEnforce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.enforce()
+            self?.refreshStatusItem()
+        }
+        pendingEnforce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func registerListeners() {
+        for selector in [kAudioHardwarePropertyDefaultInputDevice,
+                         kAudioHardwarePropertyDefaultOutputDevice] {
+            var addr = address(selector)
+            AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { [weak self] _, _ in
+                self?.enforce()
+                self?.refreshStatusItem()
+            }
+        }
+        var devicesAddr = address(kAudioHardwarePropertyDevices)
+        AudioObjectAddPropertyListenerBlock(system, &devicesAddr, DispatchQueue.main) { [weak self] _, _ in
+            self?.scheduleEnforce()
+        }
+    }
+
+    // MARK: 音質の判定
+
+    /// 既定出力が Bluetooth かつサンプルレートが A2DP 相当を下回る＝ハンズフリーに落ちている。
+    private var isHandsFreeDegraded: Bool {
+        let output = defaultOutputDevice()
+        return transportType(output) == kAudioDeviceTransportTypeBluetooth
+            && sampleRate(output) < a2dpMinimumSampleRate
+    }
+
+    private func outputSummary() -> String {
+        let output = defaultOutputDevice()
+        let rate = String(format: "%.1f", sampleRate(output) / 1000)
+        guard transportType(output) == kAudioDeviceTransportTypeBluetooth else {
+            return "\(deviceName(output))  \(rate)kHz"
+        }
+        let quality = isHandsFreeDegraded ? "ハンズフリー・音質低下" : "A2DP 高音質"
+        return "\(deviceName(output))  \(rate)kHz  \(quality)"
+    }
+
+    private func lockedDeviceDescription() -> String {
+        guard let uid = lockedUID else { return "固定しない" }
+        if let id = device(forUID: uid) { return deviceName(id) }
+        return "未接続のデバイス"
+    }
+
+    private func refreshStatusItem() {
+        // 四角囲みにしているのは、メニューバーに並ぶ他のマイクアイコン（voicekey・
+        // macOS のマイク使用中インジケータ）と一目で見分けるため。
+        let symbol: String
+        if isHandsFreeDegraded {
+            symbol = "exclamationmark.triangle.fill"
+        } else if lockedUID == nil {
+            symbol = "mic.square"
+        } else {
+            symbol = "mic.square.fill"
+        }
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "mic-lock")
+        image?.isTemplate = true
+        statusItem.button?.image = image
+        statusItem.button?.toolTip = "入力: \(deviceName(defaultInputDevice()))\n出力: \(outputSummary())"
+    }
+
+    // MARK: メニュー
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        menu.addItem(informational("入力: \(deviceName(defaultInputDevice()))"))
+        menu.addItem(informational("出力: \(outputSummary())"))
+        menu.addItem(.separator())
+        menu.addItem(informational("固定するマイク"))
+
+        for id in inputDevices() {
+            let item = NSMenuItem(title: deviceName(id),
+                                  action: #selector(selectDevice(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = deviceUID(id)
+            item.state = (deviceUID(id) == lockedUID) ? .on : .off
+            menu.addItem(item)
+        }
+
+        // 固定先が今つながっていないことを黙って隠さない
+        if let uid = lockedUID, device(forUID: uid) == nil {
+            menu.addItem(informational("固定先が未接続（つながり次第また固定する）"))
+        }
+
+        let noLock = NSMenuItem(title: "固定しない", action: #selector(disableLock), keyEquivalent: "")
+        noLock.target = self
+        noLock.state = (lockedUID == nil) ? .on : .off
+        menu.addItem(noLock)
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "mic-lock を終了", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+    }
+
+    private func informational(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    @objc private func selectDevice(_ sender: NSMenuItem) {
+        guard let uid = sender.representedObject as? String else { return }
+        lockedUID = uid
+        logger.notice("固定先を \(sender.title, privacy: .public) に変更した")
+        enforce()
+        refreshStatusItem()
+    }
+
+    @objc private func disableLock() {
+        lockedUID = nil
+        logger.notice("固定を解除した")
+        refreshStatusItem()
+    }
+
+    @objc private func quit() {
+        logger.notice("mic-lock を終了した")
+        NSApp.terminate(nil)
+    }
+
+    /// 検証用。実際に組み立てたメニューを標準出力に吐く（--dump-menu）。
+    func dumpMenu() {
+        let menu = NSMenu()
+        menuNeedsUpdate(menu)
+        for item in menu.items {
+            if item.isSeparatorItem {
+                print("  ----------")
+                continue
+            }
+            let mark = item.state == .on ? "✓" : (item.action == nil ? " ·" : "  ")
+            print("\(mark) \(item.title)")
+        }
+        print("\nアイコン状態: ハンズフリー転落=\(isHandsFreeDegraded) 固定先=\(lockedDeviceDescription())")
     }
 }
 
-// デフォルト入力の変更だけでなくデバイス一覧の変更も見る。
-// Bluetooth 接続直後は「デバイス追加 → 少し遅れて入力が奪われる」順で起きることがあるため。
-private var pending: DispatchWorkItem?
-private func scheduleEnforce() {
-    pending?.cancel()
-    let work = DispatchWorkItem(block: enforceBuiltInInput)
-    pending = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+let app = NSApplication.shared
+let delegate = AppDelegate()
+
+if CommandLine.arguments.contains("--dump-menu") {
+    delegate.dumpMenu()
+    exit(0)
 }
 
-var defaultInputAddress = address(kAudioHardwarePropertyDefaultInputDevice)
-AudioObjectAddPropertyListenerBlock(system, &defaultInputAddress, DispatchQueue.main) { _, _ in
-    enforceBuiltInInput()
-}
-
-var deviceListAddress = address(kAudioHardwarePropertyDevices)
-AudioObjectAddPropertyListenerBlock(system, &deviceListAddress, DispatchQueue.main) { _, _ in
-    scheduleEnforce()
-}
-
-logger.notice("mic-lock 起動 現在の入力=\(deviceName(defaultInputDevice()), privacy: .public)")
-enforceBuiltInInput()
-CFRunLoopRun()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()

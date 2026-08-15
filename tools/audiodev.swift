@@ -70,9 +70,19 @@ AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size)
 var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
 AudioObjectGetPropertyData(system, &a, 0, nil, &size, &ids)
 
+func uid(_ id: AudioDeviceID) -> String {
+    var value: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    var a = address(kAudioDevicePropertyDeviceUID)
+    guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &value) == noErr,
+          let u = value?.takeRetainedValue() else { return "-" }
+    return u as String
+}
+
 let cur = currentInput()
 print("既定入力: \(cur) \(name(cur)) [\(transport(cur))]")
 print("--- 入力を持つデバイス ---")
 for id in ids where hasInput(id) {
     print("\(id)\t\(transport(id))\t\(name(id))\(id == cur ? "  <= 現在" : "")")
+    print("\tUID: \(uid(id))")
 }
