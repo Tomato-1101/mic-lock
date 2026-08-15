@@ -50,6 +50,9 @@ CoreAudio のプロパティリスナによるイベント駆動。ポーリン�
 - `kAudioHardwarePropertyDefaultOutputDevice` — 出力の変化（音質表示の更新）
 - `kAudioHardwarePropertyDevices` — デバイス一覧の変化（接続直後は「デバイス追加 → 遅れて入力が奪われる」順で
   起きるため 0.4 秒後に再判定）
+- `kAudioDevicePropertyNominalSampleRate`（既定出力デバイス自身に登録） — **A2DP ⇄ HFP の遷移は
+  「既定出力デバイスの変更」では通知されない**（同じデバイスのままサンプルレートだけ変わる）。
+  これを入れないと HFP に落ちた後アイコンが警告のまま固まる。出力デバイスが変わったらリスナを付け替える
 
 マイク権限は不要（デバイスの列挙と選択のみで、音声は一切取得しない）。
 

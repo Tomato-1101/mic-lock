@@ -196,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var addr = address(selector)
             AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { [weak self] _, _ in
                 self?.enforce()
+                self?.watchOutputSampleRate()
                 self?.refreshStatusItem()
             }
         }
@@ -203,6 +204,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AudioObjectAddPropertyListenerBlock(system, &devicesAddr, DispatchQueue.main) { [weak self] _, _ in
             self?.scheduleEnforce()
         }
+        watchOutputSampleRate()
+    }
+
+    private var watchedOutputDevice: AudioDeviceID?
+    private var sampleRateListener: AudioObjectPropertyListenerBlock?
+
+    /// A2DP ⇄ HFP の遷移は既定出力デバイスの「変更」では通知されない（同じデバイスのまま
+    /// サンプルレートだけ変わる）。そのデバイス自身のサンプルレートを監視する必要がある。
+    private func watchOutputSampleRate() {
+        let output = defaultOutputDevice()
+        guard output != watchedOutputDevice else { return }
+
+        var addr = address(kAudioDevicePropertyNominalSampleRate)
+        if let previous = watchedOutputDevice, let listener = sampleRateListener {
+            AudioObjectRemovePropertyListenerBlock(previous, &addr, DispatchQueue.main, listener)
+        }
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.refreshStatusItem()
+        }
+        AudioObjectAddPropertyListenerBlock(output, &addr, DispatchQueue.main, listener)
+        watchedOutputDevice = output
+        sampleRateListener = listener
     }
 
     // MARK: 音質の判定
@@ -231,6 +254,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshStatusItem() {
+        // --dump-menu ではステータス項目を作らずにメニューだけ組み立てる
+        guard let statusItem else { return }
+
         // 四角囲みにしているのは、メニューバーに並ぶ他のマイクアイコン（voicekey・
         // macOS のマイク使用中インジケータ）と一目で見分けるため。
         let symbol: String
@@ -250,6 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: メニュー
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshStatusItem() // 開いた時点の実状態にアイコンも合わせる
         menu.removeAllItems()
 
         menu.addItem(informational("入力: \(deviceName(defaultInputDevice()))"))
