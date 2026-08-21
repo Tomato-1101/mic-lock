@@ -66,6 +66,11 @@ CoreAudio のプロパティリスナによるイベント駆動。ポーリン�
 
 `~/Library/LaunchAgents/com.tomato.mic-lock.plist`
 
+> **注意: plist の `ProgramArguments` はバイナリの絶対パス直書き**（`/Users/tomato/Project/mic-lock/dist/...`）。
+> リポジトリを移動・リネームすると launchd がバイナリを見つけられず常駐が静かに止まる
+> （失敗は `log show --predicate 'process == "launchd"'` に出るだけで、メニューバーからアイコンが消えるだけに見える）。
+> 別の場所に置くときは plist のパスを実環境に書き換えてから `bootout` → `bootstrap` し直す。
+
 ```sh
 # 起動
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tomato.mic-lock.plist

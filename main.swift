@@ -26,19 +26,21 @@ private func address(_ selector: AudioObjectPropertySelector,
                                mElement: kAudioObjectPropertyElementMain)
 }
 
-private func deviceID(for selector: AudioObjectPropertySelector) -> AudioDeviceID {
+// 取得に失敗したときの 0 を「実在するデバイス」として扱うと表示・判定が狂うので nil にする。
+private func deviceID(for selector: AudioObjectPropertySelector) -> AudioDeviceID? {
     var id = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
     var addr = address(selector)
-    AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &id)
+    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &id) == noErr,
+          id != kAudioObjectUnknown else { return nil }
     return id
 }
 
-private func defaultInputDevice() -> AudioDeviceID {
+private func defaultInputDevice() -> AudioDeviceID? {
     deviceID(for: kAudioHardwarePropertyDefaultInputDevice)
 }
 
-private func defaultOutputDevice() -> AudioDeviceID {
+private func defaultOutputDevice() -> AudioDeviceID? {
     deviceID(for: kAudioHardwarePropertyDefaultOutputDevice)
 }
 
@@ -67,8 +69,9 @@ private func stringProperty(_ id: AudioDeviceID, _ selector: AudioObjectProperty
     return result as String
 }
 
-private func deviceName(_ id: AudioDeviceID) -> String {
-    stringProperty(id, kAudioObjectPropertyName) ?? "不明なデバイス"
+private func deviceName(_ id: AudioDeviceID?) -> String {
+    guard let id, let name = stringProperty(id, kAudioObjectPropertyName) else { return "不明なデバイス" }
+    return name
 }
 
 // AudioDeviceID は再接続で変わるため、固定先の永続化には UID を使う。
@@ -76,11 +79,12 @@ private func deviceUID(_ id: AudioDeviceID) -> String? {
     stringProperty(id, kAudioDevicePropertyDeviceUID)
 }
 
-private func sampleRate(_ id: AudioDeviceID) -> Double {
+// 失敗時の 0 をそのまま返すと「A2DP 未満＝音質低下」と誤判定されるため nil にする。
+private func sampleRate(_ id: AudioDeviceID) -> Double? {
     var value: Float64 = 0
     var size = UInt32(MemoryLayout<Float64>.size)
     var addr = address(kAudioDevicePropertyNominalSampleRate)
-    AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr, value > 0 else { return nil }
     return value
 }
 
@@ -167,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func enforce() {
         guard let uid = lockedUID else { return }
         guard let target = device(forUID: uid) else { return } // 固定先が未接続なら何もしない
-        let current = defaultInputDevice()
+        guard let current = defaultInputDevice() else { return } // 現在の既定入力が読めないと比較できない
         guard current != target else { return }
 
         let takenBy = deviceName(current)
@@ -191,18 +195,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func registerListeners() {
+        // 登録に失敗するとアイコンは出るのに固定も表示更新も一切動かない。黙って壊れないよう必ず記録する。
         for selector in [kAudioHardwarePropertyDefaultInputDevice,
                          kAudioHardwarePropertyDefaultOutputDevice] {
             var addr = address(selector)
-            AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { [weak self] _, _ in
+            let status = AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { [weak self] _, _ in
                 self?.enforce()
                 self?.watchOutputSampleRate()
                 self?.refreshStatusItem()
             }
+            if status != noErr {
+                logger.fault("既定デバイス変更の監視登録に失敗した selector=\(selector) status=\(status) 固定が働かない")
+            }
         }
         var devicesAddr = address(kAudioHardwarePropertyDevices)
-        AudioObjectAddPropertyListenerBlock(system, &devicesAddr, DispatchQueue.main) { [weak self] _, _ in
+        let devicesStatus = AudioObjectAddPropertyListenerBlock(system, &devicesAddr, DispatchQueue.main) { [weak self] _, _ in
             self?.scheduleEnforce()
+        }
+        if devicesStatus != noErr {
+            logger.fault("デバイス一覧変更の監視登録に失敗した status=\(devicesStatus) 接続時の再固定が働かない")
         }
         watchOutputSampleRate()
     }
@@ -213,17 +224,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// A2DP ⇄ HFP の遷移は既定出力デバイスの「変更」では通知されない（同じデバイスのまま
     /// サンプルレートだけ変わる）。そのデバイス自身のサンプルレートを監視する必要がある。
     private func watchOutputSampleRate() {
-        let output = defaultOutputDevice()
+        guard let output = defaultOutputDevice() else { return }
         guard output != watchedOutputDevice else { return }
 
         var addr = address(kAudioDevicePropertyNominalSampleRate)
         if let previous = watchedOutputDevice, let listener = sampleRateListener {
             AudioObjectRemovePropertyListenerBlock(previous, &addr, DispatchQueue.main, listener)
         }
+        // 登録に失敗したら「監視中」の状態を残さない（次回の解除が不整合になるため）
+        watchedOutputDevice = nil
+        sampleRateListener = nil
+
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.refreshStatusItem()
         }
-        AudioObjectAddPropertyListenerBlock(output, &addr, DispatchQueue.main, listener)
+        let status = AudioObjectAddPropertyListenerBlock(output, &addr, DispatchQueue.main, listener)
+        guard status == noErr else {
+            logger.fault("出力サンプルレートの監視登録に失敗した status=\(status) 音質低下の表示が更新されない")
+            return
+        }
         watchedOutputDevice = output
         sampleRateListener = listener
     }
@@ -231,20 +250,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 音質の判定
 
     /// 既定出力が Bluetooth かつサンプルレートが A2DP 相当を下回る＝ハンズフリーに落ちている。
-    private var isHandsFreeDegraded: Bool {
-        let output = defaultOutputDevice()
-        return transportType(output) == kAudioDeviceTransportTypeBluetooth
-            && sampleRate(output) < a2dpMinimumSampleRate
+    /// デバイスやサンプルレートが取れないときは nil（判定不能）。取得失敗を「音質低下」と誤表示しないため。
+    private var isHandsFreeDegraded: Bool? {
+        guard let output = defaultOutputDevice() else { return nil }
+        guard transportType(output) == kAudioDeviceTransportTypeBluetooth else { return false }
+        guard let rate = sampleRate(output) else { return nil }
+        return rate < a2dpMinimumSampleRate
     }
 
     private func outputSummary() -> String {
-        let output = defaultOutputDevice()
-        let rate = String(format: "%.1f", sampleRate(output) / 1000)
+        guard let output = defaultOutputDevice() else { return "不明なデバイス" }
+        let rate = sampleRate(output).map { String(format: "%.1fkHz", $0 / 1000) } ?? "kHz 不明"
         guard transportType(output) == kAudioDeviceTransportTypeBluetooth else {
-            return "\(deviceName(output))  \(rate)kHz"
+            return "\(deviceName(output))  \(rate)"
         }
-        let quality = isHandsFreeDegraded ? "ハンズフリー・音質低下" : "A2DP 高音質"
-        return "\(deviceName(output))  \(rate)kHz  \(quality)"
+        let quality: String
+        if let degraded = isHandsFreeDegraded {
+            quality = degraded ? "ハンズフリー・音質低下" : "A2DP 高音質"
+        } else {
+            quality = "音質判定不能"
+        }
+        return "\(deviceName(output))  \(rate)  \(quality)"
     }
 
     private func lockedDeviceDescription() -> String {
@@ -260,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 四角囲みにしているのは、メニューバーに並ぶ他のマイクアイコン（voicekey・
         // macOS のマイク使用中インジケータ）と一目で見分けるため。
         let symbol: String
-        if isHandsFreeDegraded {
+        if isHandsFreeDegraded == true {
             symbol = "exclamationmark.triangle.fill"
         } else if lockedUID == nil {
             symbol = "mic.square"
@@ -285,12 +311,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(informational("固定するマイク"))
 
         for id in inputDevices() {
+            // UID が取れないデバイスは固定先として保存できない。選べる見た目にすると
+            // クリックしても無反応になるので、理由を書いた無効項目として出す。
+            guard let uid = deviceUID(id) else {
+                menu.addItem(informational("\(deviceName(id))（UID が取れず固定できない）"))
+                continue
+            }
             let item = NSMenuItem(title: deviceName(id),
                                   action: #selector(selectDevice(_:)),
                                   keyEquivalent: "")
             item.target = self
-            item.representedObject = deviceUID(id)
-            item.state = (deviceUID(id) == lockedUID) ? .on : .off
+            item.representedObject = uid
+            item.state = (uid == lockedUID) ? .on : .off
             menu.addItem(item)
         }
 
@@ -347,7 +379,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let mark = item.state == .on ? "✓" : (item.action == nil ? " ·" : "  ")
             print("\(mark) \(item.title)")
         }
-        print("\nアイコン状態: ハンズフリー転落=\(isHandsFreeDegraded) 固定先=\(lockedDeviceDescription())")
+        let degraded = isHandsFreeDegraded.map { $0 ? "yes" : "no" } ?? "判定不能"
+        print("\nアイコン状態: ハンズフリー転落=\(degraded) 固定先=\(lockedDeviceDescription())")
     }
 }
 
